@@ -24,3 +24,5 @@ myenv/
 # Ignore compiled files
 *.so
 *.egg-info/
+
+Workflow.md
