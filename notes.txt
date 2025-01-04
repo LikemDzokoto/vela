@@ -1,1 +1,1 @@
-1. Finish working on getting  all binance symbol and getting marketcap info from coingecko 
+1. Finish working on getting  all binance symbols and getting marketcap info from coingecko 
