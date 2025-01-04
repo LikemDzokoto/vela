@@ -26,3 +26,5 @@ myenv/
 *.egg-info/
 
 Workflow.md
+notes.txt
+temp.csv
