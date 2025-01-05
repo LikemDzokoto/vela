@@ -1,9 +1,11 @@
 import os
 from binance.client import Client
-from dotenv import load_dotenv
-
 import pandas as pd
+from dotenv import load_dotenv
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
+# Load environment variables
 load_dotenv()
 
 API_KEY = os.getenv('BINANCE_API_KEY')
@@ -11,100 +13,123 @@ API_SECRET = os.getenv('BINANCE_API_SECRET')
 
 client = Client(API_KEY, API_SECRET)
 
-
-
-logging.basicConfig(level=logging.INFO)
-
-from datetime import datetime, timedelta
-
-def is_recently_listed(listing_date, months=3):
+def get_filtered_symbols_parallel(market_cap_threshold=100_000_000, min_volume=1_000_000, min_days_listed=90):
     """
-    Check if a coin was listed within the specified number of months.
-    """
-    current_date = datetime.now()
-    listing_date = datetime.strptime(listing_date, "%Y-%m-%d")
-    return listing_date >= (current_date - timedelta(days=months*30))
+    Fetch USDT trading pairs with specific conditions using parallel processing:
+      - Market cap below the threshold.
+      - Minimum 24-hour trading volume.
+      - Listed for at least the specified number of days.
 
-def get_listing_dates():
+    Returns:
+        list: Filtered symbols meeting the criteria.
     """
-    Get listing dates for USDT trading pairs.
-    """
+    print("Fetching exchange info...")
     exchange_info = client.get_exchange_info()
-    listing_dates = {}
-    for symbol_info in exchange_info['symbols']:
-        symbol = symbol_info['symbol']
-        if symbol.endswith('USDT') and 'permissions' in symbol_info and 'SPOT' in symbol_info['permissions']:
-            listing_dates[symbol] = symbol_info['onboardDate'][:10]
-    return listing_dates
+    symbols = [
+        symbol_info['symbol'] for symbol_info in exchange_info['symbols']
+        if symbol_info['symbol'].endswith('USDT') and symbol_info['status'] == 'TRADING'
+    ]
 
-def get_small_cap_coins(market_cap_threshold=100_000_000, months_since_listing=3):
-    """
-    Fetch coins with market cap under the specified threshold that were listed within the specified months.
-    """
-    
-    tickers = client.get_all_tickers()
-    listing_dates = get_listing_dates()
-    
-    # small-cap coins (market cap under $100M) listed within last 3 months
-    small_cap_coins = []
-    for ticker in tickers:
-        symbol = ticker['symbol']
-        if symbol.endswith('USDT') and symbol in listing_dates:  # Only consider USDT pairs
-            try:
-                # Get 24hr ticker data for market cap calculation
-                ticker_24hr = client.get_ticker(symbol=symbol)
-                volume = float(ticker_24hr['quoteVolume'])
-                price = float(ticker_24hr['lastPrice'])
-                market_cap = volume * price
-                
-                # Debug logging
-                print(f"Processing {symbol}:")
-                print(f"  Market Cap: {market_cap}")
-                print(f"  Listing Date: {listing_dates[symbol]}")
-                print(f"  Recently Listed: {is_recently_listed(listing_dates[symbol], months_since_listing)}")
-                
-                # Check both market cap and listing date
-                if market_cap < market_cap_threshold:
-                    if is_recently_listed(listing_dates[symbol], months_since_listing):
-                        small_cap_coins.append(symbol)
-                        print(f"  Added {symbol} to small-cap coins")
-                    else:
-                        print(f"  {symbol} not recently listed")
-                else:
-                    print(f"  {symbol} market cap too high")
-            except Exception as e:
-                print(f"Error processing {symbol}: {e}")
-    
-    return small_cap_coins
+    def process_symbol(symbol):
+        try:
+            ticker_24hr = client.get_ticker(symbol=symbol)
+            volume = float(ticker_24hr['quoteVolume'])
+            price = float(ticker_24hr['lastPrice'])
+            market_cap = volume * price
 
-def fetch_price_volume_data(symbol, interval='5m', limit=60):
+            # Fetch listing age (minimum 90 daily klines required)
+            klines = client.get_klines(symbol=symbol, interval='1d', limit=min_days_listed)
+
+            if (
+                market_cap < market_cap_threshold
+                and volume >= min_volume
+                and len(klines) >= min_days_listed
+            ):
+                return {
+                    'symbol': symbol,
+                    'market_cap': market_cap,
+                    'volume': volume,
+                    'days_listed': len(klines)
+                }
+        except Exception as e:
+            print(f"Error processing {symbol}: {e}")
+        return None
+
+    print("Processing symbols in parallel...")
+    with ThreadPoolExecutor() as executor:
+        results = list(tqdm(executor.map(process_symbol, symbols), total=len(symbols), desc="Processing symbols"))
+
+    filtered_symbols = [result for result in results if result is not None]
+    return sorted(filtered_symbols, key=lambda x: x['market_cap'])
+
+def fetch_historical_data(symbol, interval='15m', days=14):
     """
-    Fetch OHLC and volume data for a given symbol.
+    Fetch historical OHLC and volume data for a given symbol.
+
+    Args:
+        symbol (str): The cryptocurrency trading pair symbol (e.g., BonkUSDT).
+        interval (str): The time interval for the kline data (e.g., '15m').
+        days (int): Number of days to fetch data for.
+
+    Returns:
+        pd.DataFrame: DataFrame containing OHLC and volume data.
     """
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        return [{
-            'timestamp': kline[0],
+        print(f"Fetching historical data for {symbol} ({interval}, {days} days)...")
+        since = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp() * 1000)
+
+        klines = client.get_historical_klines(symbol, interval, start_str=since)
+
+        data = [{
+            'timestamp': pd.to_datetime(kline[0], unit='ms'),
             'open': float(kline[1]),
             'high': float(kline[2]),
             'low': float(kline[3]),
             'close': float(kline[4]),
             'volume': float(kline[5])
         } for kline in klines]
+
+        return pd.DataFrame(data)
+
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
-        return None
+        return pd.DataFrame()
+
+def main():
+   
+    filtered_symbols = get_filtered_symbols_parallel()
+
+    if not filtered_symbols:
+        print("No symbols met the criteria.")
+    else:
+        print(f"Filtered symbols found: {len(filtered_symbols)}")
+
+        all_data = []
+        for symbol_data in tqdm(filtered_symbols[:4], desc="Fetching historical data"):
+            symbol = symbol_data['symbol']
+            ohlc_data = fetch_historical_data(symbol, interval='15m', days=14)
+
+            if not ohlc_data.empty:
+                ohlc_data['symbol'] = symbol.replace('USDT', '')                                    
+                ohlc_data['market_cap'] = symbol_data['market_cap']
+
+                ohlc_data['market_cap'] = ohlc_data['market_cap'] * 1e6
+                ohlc_data['volume'] = symbol_data['volume']
+
+                
+
+
+                ohlc_data[['open', 'high', 'low', 'close']] = ohlc_data[['open', 'high', 'low', 'close']].map(lambda x: f"{x:.8f}")
+               
+                all_data.append(ohlc_data[['timestamp','symbol', 'market_cap','open', 'high', 'low', 'close', 'volume']])
+
+        
+        if all_data:
+            combined_data = pd.concat(all_data, ignore_index=True)
+            combined_data.to_csv("small_capped_coins.csv", index=False)
+            print("Historical data and market cap information saved to small_capped_coins.csv.")
+        else:
+            print("No historical data available for the filtered symbols.")
 
 if __name__ == "__main__":
-    small_cap_coins = get_small_cap_coins()
-    print(f"Small-cap coins: {small_cap_coins}")
-
-    small_cap_df = pd.DataFrame(small_cap_coins , columns=['Symbol'])
-    small_cap_df.to_csv('small_cap_coins.csv', index = False)
-    
-    if small_cap_coins:
-        coin_data = fetch_price_volume_data(small_cap_coins[0])
-        if coin_data:
-            coin_df = pd.DataFrame(coin_data)
-            coin_df.to_csv(f'{small_cap_coins[0]}_price_volume_data.csv', index=False)
-        print(f"Sample data for {small_cap_coins[0]}: {coin_data[:1]}")
+    main()
